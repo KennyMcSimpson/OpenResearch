@@ -36,6 +36,39 @@ test("markdown paths cannot escape their root", () => {
   assert.equal(resolveMarkdownTarget("docs", "../../secret.png"), null);
   assert.equal(resolveMarkdownTarget("", "../secret.png"), null);
   assert.equal(resolveMarkdownTarget("", "%E0%A4%A"), null);
+  assert.equal(resolveMarkdownTarget("docs", "..%2F..%2Fsecret.png"), null);
+  assert.equal(resolveMarkdownTarget("", "%2E%2E%2Fsecret.png"), null);
+  assert.equal(resolveMarkdownTarget("", "figure%00.png"), null);
+});
+
+test("markdown paths decode reserved filename characters once before API encoding", () => {
+  for (const [encoded, filename] of [
+    ["chart%231.png", "chart#1.png"],
+    ["chart%3F1.png", "chart?1.png"],
+    ["chart%26legend.png", "chart&legend.png"],
+    ["chart%3A1.png", "chart:1.png"],
+    ["chart%25231.png", "chart%231.png"],
+  ]) {
+    const target = resolveMarkdownTarget("docs", `${encoded}?raw=1#preview`);
+    assert.deepEqual(target, { path: `docs/${filename}`, query: "raw=1", hash: "#preview" });
+    const url = markdownTargetUrl(`/api/file/raw?path=${encodeURIComponent(target.path)}`, target);
+    const parsed = new URL(url, "http://localhost");
+    assert.equal(parsed.searchParams.get("path"), `docs/${filename}`);
+    assert.equal(parsed.searchParams.get("raw"), "1");
+    assert.equal(parsed.hash, "#preview");
+  }
+});
+
+test("chat images decode reserved filenames without accepting query overrides", () => {
+  assert.deepEqual(chatImageTarget("figures/chart%231.png?path=/secret&sessionId=other#plot"), {
+    path: "figures/chart#1.png", hash: "#plot", source: "checkout",
+  });
+  assert.deepEqual(chatImageTarget("artifacts/chart%3F1%26legend.png#plot"), {
+    path: "chart?1&legend.png", hash: "#plot", source: "artifact",
+  });
+  assert.equal(chatImageTarget("../secret.png"), null);
+  assert.equal(chatImageTarget("%2E%2E%2Fsecret.png"), null);
+  assert.equal(chatImageTarget("figure%00.png"), null);
 });
 
 test("absolute markdown files preserve filesystem-rooted image paths", () => {
