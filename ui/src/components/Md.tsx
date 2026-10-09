@@ -24,7 +24,7 @@ import { normalizeMarkdownForRendering } from "../markdownNormalization";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { Button, IconButton, IconButtonLink } from "./ui";
 import { absoluteFileUrl, artifactUrl, projectFileUrl } from "../api";
-import { chatImageTarget, firstCitedLine, rehypeSafeUrls, splitLineSuffix } from "../markdownTarget";
+import { chatImageTarget, firstCitedLine, isWindowsDrivePath, rehypeSafeUrls, resolveMarkdownTarget, splitLineSuffix } from "../markdownTarget";
 
 const ImageResolverContext = createContext<((src: string, fallback?: boolean) => string | null) | undefined>(undefined);
 
@@ -402,7 +402,8 @@ export const Md = memo(function Md({
     intent: TabOpenIntent,
   ) => void;
   onOpenRun?: (runId: string, intent: TabOpenIntent) => void;
-  resolveFilePath?: (path: string) => string | null;
+  /** Resolve a URI-encoded Markdown target to a filesystem path. */
+  resolveFilePath?: (target: string) => string | null;
   resolveImageSrc?: (src: string) => string | null;
   predict?: boolean;
 }) {
@@ -440,7 +441,9 @@ export const Md = memo(function Md({
       const figure = typeof figureSrc === "string" ? chatImageTarget(figureSrc) : null;
       if (figure && onOpenFile) {
         const localPath = figure.source === "artifact" ? `artifacts/${figure.path}` : figure.path;
-        const path = resolveFilePath ? resolveFilePath(localPath) : localPath;
+        const path = resolveFilePath
+          ? resolveFilePath(isWindowsDrivePath(figureSrc) ? figureSrc.replaceAll("\\", "/") : figureSrc)
+          : localPath;
         if (path) return <button type="button" className="text-primary underline cursor-pointer text-start"
           {...tabOpenGestureHandlers<HTMLButtonElement>((intent) => onOpenFile(path, undefined, undefined, undefined, intent))}>
           {children}
@@ -451,13 +454,9 @@ export const Md = memo(function Md({
       const target = typeof citedHref === "string" ? citedHref : href;
       const cited = target ? splitLineSuffix(target) : null;
       if (cited && isFileHref(cited.path) && onOpenFile) {
-        let decoded: string;
-        try {
-          decoded = decodeURI(cited.path);
-        } catch {
-          return <span>{children}</span>;
-        }
-        const path = resolveFilePath ? resolveFilePath(decoded) : decoded;
+        const path = resolveFilePath
+          ? resolveFilePath(cited.path)
+          : resolveMarkdownTarget("", cited.path, true)?.path;
         return path ? <FileChip path={path} line={cited.line} onOpenFile={onOpenFile} /> : <span>{children}</span>;
       }
       return (
