@@ -6,7 +6,10 @@ import { unified } from "unified";
 
 import {
   chatImageTarget,
+  citedFilePath,
+  encodeMarkdownPath,
   firstCitedLine,
+  htmlFigureAssetTarget,
   isExternalMarkdownTarget,
   markdownTargetUrl,
   rehypeSafeUrls,
@@ -32,43 +35,81 @@ test("repository markdown resolves images relative to the document", () => {
   });
 });
 
+test("markdown paths decode percent-encoded reserved filename characters once", () => {
+  assert.deepEqual(resolveMarkdownTarget("docs", "figures/chart%231.png"), {
+    path: "docs/figures/chart#1.png",
+    query: "",
+    hash: "",
+  });
+  assert.equal(resolveMarkdownTarget("", "a%3Fb%26c%3Ad.png")?.path, "a?b&c:d.png");
+  assert.deepEqual(resolveMarkdownTarget("docs", "chart%231.png?raw=1#plot"), {
+    path: "docs/chart#1.png",
+    query: "raw=1",
+    hash: "#plot",
+  });
+  assert.equal(resolveMarkdownTarget("docs", "chart%25231.png")?.path, "docs/chart%231.png");
+  assert.deepEqual(chatImageTarget("figures/chart%231.png"), {
+    path: "figures/chart#1.png",
+    hash: "",
+    source: "checkout",
+  });
+});
+
+test("re-resolved markdown paths are decoded only once", () => {
+  for (const name of ["chart#1.png", "chart%231.png", "a?b&c:d.png", "100%.png", "my figs/a b.png"]) {
+    assert.equal(resolveMarkdownTarget("", encodeMarkdownPath(name))?.path, name);
+  }
+  const docLink = (target) => resolveMarkdownTarget("docs", target)?.path ?? null;
+  assert.equal(citedFilePath("foo%2523bar.py", docLink), "docs/foo%23bar.py");
+  assert.equal(citedFilePath("foo%23bar.py", docLink), "docs/foo#bar.py");
+  assert.equal(citedFilePath("foo%2523bar.py"), "foo%23bar.py");
+  assert.equal(citedFilePath("%E0%A4%A"), null);
+  const figure = chatImageTarget("figures/chart%231.png");
+  assert.equal(docLink(encodeMarkdownPath(figure.path)), "docs/figures/chart#1.png");
+});
+
+test("chat file links decode reserved filename characters without a resolver", () => {
+  for (const [target, filename] of [
+    ["chart%231.png", "chart#1.png"],
+    ["chart%3F1.png", "chart?1.png"],
+    ["chart%26draft.png", "chart&draft.png"],
+    ["chart%3A42.py", "chart:42.py"],
+    ["chart%25231.png", "chart%231.png"],
+  ]) {
+    assert.equal(citedFilePath(target), filename);
+  }
+  assert.equal(citedFilePath("bad%escape.png"), null);
+});
+
+test("inline html figure assets resolve relative to the figure once", () => {
+  const asset = (source, src) => chatImageTarget(htmlFigureAssetTarget(source, src));
+  assert.deepEqual(asset("my%20figs/plot.html", "chart%231.png#x"), {
+    path: "my figs/chart#1.png",
+    hash: "#x",
+    source: "checkout",
+  });
+  assert.equal(asset("figs/plot.html", "chart%25231.png").path, "figs/chart%231.png");
+  assert.equal(asset("figs/plot.html", "a%3Fb.png").path, "figs/a?b.png");
+  assert.equal(asset("plot.html", "a%3Ab.png").path, "a:b.png");
+  assert.equal(asset("/tmp/r/plot.html", "../a%231.png").path, "/tmp/a#1.png");
+  assert.equal(htmlFigureAssetTarget("%E0%A4%A/plot.html", "a.png"), null);
+});
+
+test("inline html figure assets on Windows figures stay absolute", () => {
+  const asset = (source, src) => chatImageTarget(htmlFigureAssetTarget(source, src));
+  for (const source of ["C:/figs/plot.html", String.raw`C:\figs\plot.html`, "C%3A/figs/plot.html"]) {
+    assert.deepEqual(asset(source, "chart.png"), {
+      path: "C:/figs/chart.png", hash: "", source: "absolute",
+    }, source);
+  }
+});
+
 test("markdown paths cannot escape their root", () => {
   assert.equal(resolveMarkdownTarget("docs", "../../secret.png"), null);
   assert.equal(resolveMarkdownTarget("", "../secret.png"), null);
   assert.equal(resolveMarkdownTarget("", "%E0%A4%A"), null);
-  assert.equal(resolveMarkdownTarget("docs", "..%2F..%2Fsecret.png"), null);
-  assert.equal(resolveMarkdownTarget("", "%2E%2E%2Fsecret.png"), null);
-  assert.equal(resolveMarkdownTarget("", "figure%00.png"), null);
-});
-
-test("markdown paths decode reserved filename characters once before API encoding", () => {
-  for (const [encoded, filename] of [
-    ["chart%231.png", "chart#1.png"],
-    ["chart%3F1.png", "chart?1.png"],
-    ["chart%26legend.png", "chart&legend.png"],
-    ["chart%3A1.png", "chart:1.png"],
-    ["chart%25231.png", "chart%231.png"],
-  ]) {
-    const target = resolveMarkdownTarget("docs", `${encoded}?raw=1#preview`);
-    assert.deepEqual(target, { path: `docs/${filename}`, query: "raw=1", hash: "#preview" });
-    const url = markdownTargetUrl(`/api/file/raw?path=${encodeURIComponent(target.path)}`, target);
-    const parsed = new URL(url, "http://localhost");
-    assert.equal(parsed.searchParams.get("path"), `docs/${filename}`);
-    assert.equal(parsed.searchParams.get("raw"), "1");
-    assert.equal(parsed.hash, "#preview");
-  }
-});
-
-test("chat images decode reserved filenames without accepting query overrides", () => {
-  assert.deepEqual(chatImageTarget("figures/chart%231.png?path=/secret&sessionId=other#plot"), {
-    path: "figures/chart#1.png", hash: "#plot", source: "checkout",
-  });
-  assert.deepEqual(chatImageTarget("artifacts/chart%3F1%26legend.png#plot"), {
-    path: "chart?1&legend.png", hash: "#plot", source: "artifact",
-  });
-  assert.equal(chatImageTarget("../secret.png"), null);
-  assert.equal(chatImageTarget("%2E%2E%2Fsecret.png"), null);
-  assert.equal(chatImageTarget("figure%00.png"), null);
+  assert.equal(resolveMarkdownTarget("", "..%2Fsecret.png"), null);
+  assert.equal(resolveMarkdownTarget("", "a%00.png"), null);
 });
 
 test("absolute markdown files preserve filesystem-rooted image paths", () => {
@@ -103,6 +144,11 @@ test("chat images resolve local paths without crossing the session root", () => 
   assert.deepEqual(chatImageTarget("C:/papers/figure.png"), {
     path: "C:/papers/figure.png", hash: "", source: "absolute",
   });
+  for (const src of ["C%3A/papers/figure.png", "C%3A%5Cpapers%5Cfigure.png"]) {
+    assert.deepEqual(chatImageTarget(src), {
+      path: "C:/papers/figure.png", hash: "", source: "absolute",
+    }, src);
+  }
   assert.deepEqual(chatImageTarget("artifacts/paper/figure.png"), {
     path: "paper/figure.png", hash: "", source: "artifact",
   });

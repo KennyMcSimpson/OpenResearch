@@ -43,6 +43,9 @@ const dependencies = {
   "../syntaxHighlight": {},
   "./ui": {},
   "../api": {},
+  "./InlineHtmlFigure": {},
+  "./ImageCarousel": {},
+  "../imageZoom": {},
 };
 const source = readFileSync(new URL("../src/components/Md.tsx", import.meta.url), "utf8");
 const code = ts.transpileModule(source, {
@@ -103,7 +106,13 @@ test("figure references pass the encoded image target to the file resolver", () 
 });
 
 test("chat file links decode filenames once without a file resolver", () => {
-  for (const [target, filename] of [["chart%231.png", "chart#1.png"], ["chart%3F1.png", "chart?1.png"], ["chart%25231.png", "chart%231.png"]]) {
+  for (const [target, filename] of [
+    ["chart%231.png", "chart#1.png"],
+    ["chart%3F1.png", "chart?1.png"],
+    ["chart%25231.png", "chart%231.png"],
+    ["chart%26draft.png", "chart&draft.png"],
+    ["chart%3A42.py", "chart:42.py"],
+  ]) {
     assert.equal(click(link(`[file](${target})`))[0], filename);
   }
 });
