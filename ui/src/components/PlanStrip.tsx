@@ -97,6 +97,7 @@ export function PlanStrip({
         <>
           <textarea
             dir="auto"
+            {...{ writingsuggestions: "false" }}
             ref={textareaRef}
             className="plan-strip-revise-input w-full resize-none border border-border rounded-md py-[9px] px-[11px] text-sm font-[inherit] bg-background text-text [&:focus]:border-accent-blue"
             placeholder={m.plan_strip_what_should_change_optional()}
@@ -104,6 +105,10 @@ export function PlanStrip({
             value={note}
             onChange={(e) => setNote(e.target.value)}
             onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+                e.stopPropagation();
+                return;
+              }
               if (e.key === "Escape") {
                 e.preventDefault();
                 setNote("");
