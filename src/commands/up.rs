@@ -126,6 +126,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         stopping: stopping.clone(),
         dashboard_lock: Arc::new(std::sync::Mutex::new(Some(dashboard_lock))),
         restart: Arc::new(tokio::sync::Notify::new()),
+        trackio: Arc::default(),
     };
     // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
     state.chat.set_up_port(actual_port);
@@ -171,6 +172,14 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.data_dir_gate.clone(),
     ));
     tokio::spawn(adopt_orphaned_runs(
+        state.data_dir_move_in_progress.clone(),
+        state.data_dir_gate.clone(),
+    ));
+    tokio::spawn(reclaim_orphaned_run_artifacts(
+        state.data_dir_move_in_progress.clone(),
+        state.data_dir_gate.clone(),
+    ));
+    tokio::spawn(reclaim_remote_run_dirs(
         state.data_dir_move_in_progress.clone(),
         state.data_dir_gate.clone(),
     ));
@@ -398,6 +407,7 @@ struct AppState {
     dashboard_lock: Arc<std::sync::Mutex<Option<DashboardLock>>>,
     /// Fired by `POST /api/update/restart`; the serve loop relaunches on it.
     restart: Arc<tokio::sync::Notify>,
+    trackio: Arc<crate::local::trackio::LocalServer>,
 }
 
 async fn project_publication_lock(
@@ -552,6 +562,10 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/runs/{id}/diff", get(run_diff))
         .route("/api/experiments/{id}/diff", get(experiment_diff))
         .route(
+            "/api/experiments/{id}",
+            axum::routing::delete(delete_experiment),
+        )
+        .route(
             "/api/experiments/{id}/archive",
             axum::routing::patch(set_experiment_archive),
         )
@@ -704,7 +718,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
             get(ray_settings).post(set_ray_settings),
         )
         .route("/api/settings/ray/preflight", post(ray_preflight))
-        .route("/api/settings/trackio", get(trackio_settings))
+        .route("/api/trackio/projects/{id}/runs", get(trackio_project_runs))
         .route("/api/settings/trackio/preflight", post(trackio_preflight))
         .route("/api/settings/compute", get(compute_settings))
         .route("/api/settings/compute/default", post(set_compute_default))
@@ -1123,7 +1137,6 @@ struct SkillsQ {
 /// built-in catalog, personal skills, and skills in the open project.
 async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
     tokio::task::spawn_blocking(move || {
-        let importing = crate::local::user_skills::refresh_imports();
         let project = q.project.as_deref().and_then(|id| {
             Store::open().ok()?.get_local_project(id).ok().flatten()
         });
@@ -1164,7 +1177,7 @@ async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
                 "harness": q.harness,
             }));
         }
-        Json(json!({ "skills": skills, "importing": importing }))
+        Json(json!({ "skills": skills }))
     })
     .await
     .map_err(|e| ApiError::from(anyhow!(e)))
@@ -1219,12 +1232,11 @@ fn user_skill_json(s: &crate::local::user_skills::UserSkill) -> Value {
 /// coding agents installed on this machine.
 async fn list_user_skills() -> ApiResult {
     tokio::task::spawn_blocking(|| {
-        let importing = crate::local::user_skills::refresh_imports();
         let skills: Vec<Value> = crate::local::user_skills::list()
             .iter()
             .map(user_skill_json)
             .collect();
-        Json(json!({ "skills": skills, "importing": importing }))
+        Json(json!({ "skills": skills }))
     })
     .await
     .map_err(|e| ApiError::from(anyhow!(e)))
@@ -1493,6 +1505,7 @@ struct CreateProjectReq {
     github_sync_enabled: Option<bool>,
     /// UI locale, for the starter prompts warmed up in the background.
     locale: Option<String>,
+    starter_agent: Option<local::starter::Agent>,
 }
 
 async fn create_project(
@@ -1564,7 +1577,7 @@ async fn create_project(
     let (project, create_admission) = result.map_err(bad_request)?;
     // Starter prompts take a model call; start it now so the empty chat that
     // opens next usually finds them cached.
-    local::starter::warm(project.clone(), locale);
+    local::starter::warm(project.clone(), locale, req.starter_agent);
     let _project_admission = state
         .project_lifecycle
         .admit(&project.id)
@@ -2100,7 +2113,20 @@ async fn delete_project_inner(state: AppState, id: String, query: DeleteProjectQ
     // Refuse before anything is deleted; remove only once the rows are gone.
     let artifacts =
         local::files::plan_project_artifact_cleanup(&project, query.delete_artifacts, &projects)?;
-    store.delete_local_project(&id)?;
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let project_id = id.clone();
+    // Row deletion can wait up to RUN_ARTIFACTS_WAIT for the run-artifacts lock, so keep it off the async workers.
+    tokio::task::spawn_blocking(move || {
+        let native_purge = (!session_ids.is_empty()).then_some(|| {
+            local::chat::ChatHost::purge_native_history_blocking(&store, &session_ids)
+        });
+        store.delete_local_project_with(&project_id, native_purge)
+    })
+    .await
+    .map_err(|error| anyhow!("project row deletion task failed: {error}"))??;
     for session in &sessions {
         state.chat.claude.forget_session(&session.id).await;
         local::chat::cleanup_session_transcript_artifacts(&session.id);
@@ -2158,6 +2184,26 @@ async fn set_experiment_archive(
     }
     let ids = local::experiments::set_archived(&mut store, &id, direction, request.archived)?;
     Ok(Json(json!({ "ids": ids })))
+}
+
+async fn delete_experiment(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    // Deletion can wait up to RUN_ARTIFACTS_WAIT for the run-artifacts lock.
+    blocking_api(move || {
+        let store = Store::open()?;
+        let experiment = store
+            .get_local_experiment(&id)?
+            .ok_or_else(|| not_found("experiment"))?;
+        let _admission = state
+            .project_lifecycle
+            .admit(&experiment.project_id)
+            .ok_or_else(|| bad_request("project deletion is in progress"))?;
+        let deleted = local::experiments::delete_experiment(&store, &id).map_err(bad_request)?;
+        Ok(Json(
+            json!({ "ok": true, "branchCommit": deleted.branch_commit }),
+        ))
+    })
+    .await
 }
 
 async fn list_project_runs(Path(id): Path<String>) -> ApiResult {
@@ -2711,6 +2757,7 @@ struct PrewarmStarterPromptsReq {
     /// An existing folder the project will be created from.
     path: Option<String>,
     locale: Option<String>,
+    starter_agent: Option<local::starter::Agent>,
 }
 
 /// Start generating starter prompts for a project the user is still naming in
@@ -2734,6 +2781,7 @@ async fn prewarm_starter_prompts(Json(req): Json<PrewarmStarterPromptsReq>) -> A
         paper_id,
         path,
         req.locale.unwrap_or_else(|| "en".to_string()),
+        req.starter_agent,
     );
     Ok(Json(json!({ "ok": true })))
 }
@@ -4596,6 +4644,7 @@ impl axum::body::HttpBody for ActiveBody {
 }
 
 const ORPHANED_RUN_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const REMOTE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 /// SSH container launches record their handle before the job starts; leave them this long to finish.
 const ORPHANED_RUN_SETTLE_MS: i64 = 5 * 60 * 1000;
 
@@ -4626,6 +4675,139 @@ async fn adopt_orphaned_runs(moving: Arc<AtomicBool>, gate: Arc<tokio::sync::Mut
             }
             Err(_) => {}
         }
+    }
+}
+
+/// Background task so a large first reclaim never delays startup; it releases the gate between passes.
+async fn reclaim_orphaned_run_artifacts(
+    moving: Arc<AtomicBool>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+) {
+    // Demo prewarm skips itself when the gate is contended at startup.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Orphans and sweep failures already logged, so a stuck one logs once.
+    let mut reported = HashSet::new();
+    loop {
+        let mut more = false;
+        if !moving.load(Ordering::SeqCst) {
+            let _gate = gate.lock().await;
+            if !moving.load(Ordering::SeqCst) {
+                match tokio::task::spawn_blocking(|| {
+                    Store::open()?.cleanup_orphaned_run_artifacts()
+                })
+                .await
+                {
+                    Ok(Ok(pass)) => {
+                        more = pass.more;
+                        for (run_id, error) in pass.kept {
+                            if reported.insert(run_id.clone()) {
+                                eprintln!("orx up: keeping run artifacts for {run_id}: {error}");
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("orx up: could not clean orphaned run artifacts: {error}")
+                    }
+                    Err(error) => {
+                        eprintln!("orx up: orphaned run artifact cleanup failed: {error}")
+                    }
+                }
+                let sweeps = [
+                    (
+                        "chat attachments",
+                        Store::cleanup_orphaned_chat_attachments as fn(&Store) -> Result<bool>,
+                    ),
+                    (
+                        "native chat history",
+                        Store::cleanup_orphaned_native_sessions,
+                    ),
+                ];
+                for (label, sweep) in sweeps {
+                    match tokio::task::spawn_blocking(move || sweep(&Store::open()?)).await {
+                        Ok(Ok(left)) => more |= left,
+                        Ok(Err(error)) => {
+                            if reported.insert(format!("{label}: {error}")) {
+                                eprintln!("orx up: could not clean orphaned {label}: {error}");
+                            }
+                        }
+                        Err(error) => eprintln!("orx up: orphaned {label} cleanup failed: {error}"),
+                    }
+                }
+            }
+        }
+        let pause = if more {
+            Duration::from_secs(1)
+        } else {
+            ORPHANED_RUN_SCAN_INTERVAL
+        };
+        tokio::time::sleep(pause).await;
+    }
+}
+
+/// Runs `f` on a fresh store under the data-dir gate; `None` while the data dir is moving.
+async fn with_gated_store<T: Send + 'static>(
+    moving: &AtomicBool,
+    gate: &tokio::sync::Mutex<()>,
+    f: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+) -> Option<Result<T>> {
+    if moving.load(Ordering::SeqCst) {
+        return None;
+    }
+    let _gate = gate.lock().await;
+    if moving.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(
+        tokio::task::spawn_blocking(move || f(&Store::open()?))
+            .await
+            .unwrap_or_else(|error| Err(anyhow!("store task failed: {error}"))),
+    )
+}
+
+/// Removes queued remote run dirs; the gate is held only around store access, never over SSH.
+async fn reclaim_remote_run_dirs(moving: Arc<AtomicBool>, gate: Arc<tokio::sync::Mutex<()>>) {
+    // Startup's own SSH traffic (supervisor adoption, settings checks) goes first.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let mut reported = HashSet::new();
+    let mut plan_error = None;
+    let mut report = |failures: Vec<(String, String)>| {
+        for (run_id, error) in failures {
+            if reported.insert(run_id.clone()) {
+                eprintln!("orx up: remote cleanup for run {run_id}: {error}");
+            }
+        }
+    };
+    loop {
+        match with_gated_store(&moving, &gate, local::remote_cleanup::plan).await {
+            Some(Ok((batches, rejected))) => {
+                plan_error = None;
+                report(rejected);
+                if !batches.is_empty() {
+                    let results = local::remote_cleanup::clean(batches).await;
+                    match with_gated_store(&moving, &gate, move |store| {
+                        local::remote_cleanup::record(store, results)
+                    })
+                    .await
+                    {
+                        Some(Ok(failures)) => report(failures),
+                        Some(Err(error)) => {
+                            eprintln!("orx up: could not record remote cleanup: {error}")
+                        }
+                        // Unrecorded entries stay due and removal is idempotent.
+                        None => {}
+                    }
+                }
+            }
+            Some(Err(error)) => {
+                let error = error.to_string();
+                if plan_error.as_ref() != Some(&error) {
+                    eprintln!("orx up: could not plan remote cleanup: {error}");
+                    plan_error = Some(error);
+                }
+            }
+            None => {}
+        }
+        tokio::time::sleep(REMOTE_CLEANUP_INTERVAL).await;
     }
 }
 
@@ -5074,7 +5256,8 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
             release(&state);
             return ApiError(
                 StatusCode::CONFLICT,
-                "Another dashboard is moving the data directory.".into(),
+                "Another dashboard is moving or cleaning up the data directory; retry shortly."
+                    .into(),
             )
             .into_response();
         }
@@ -7936,7 +8119,11 @@ async fn open_side_chat(State(state): State<AppState>, Path(id): Path<String>) -
 
 async fn delete_chat_session(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
-    state.chat.delete_session(&id).await?;
+    // Detached so a canceled request cannot stop between the native purge and the row delete.
+    let chat = state.chat.clone();
+    tokio::spawn(async move { chat.delete_session(&id).await })
+        .await
+        .map_err(|error| anyhow!("chat deletion task failed: {error}"))??;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -9746,6 +9933,7 @@ mod tests {
             stopping: Default::default(),
             dashboard_lock: Default::default(),
             restart: Default::default(),
+            trackio: Default::default(),
         };
         let error = delete_artifact(
             State(state),

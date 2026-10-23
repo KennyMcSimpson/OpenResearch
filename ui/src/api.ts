@@ -290,6 +290,7 @@ export interface NewProject {
   githubSyncEnabled?: boolean;
   /** UI locale for the starter prompts the server warms up on creation. */
   locale?: string;
+  starterAgent?: Pick<AgentSelection, "harness" | "model">;
 }
 
 export interface CreateProjectResult {
@@ -354,8 +355,8 @@ export interface ProjectStarterPrompts {
   /** Empty when the project already has experiments or is blank; null when
    *  the harness could not answer. */
   prompts: StarterPrompt[] | null;
-  /** The project has nothing to read yet, so the UI offers its pre-written
-   *  prompts instead of model-generated ones. */
+  /** Use pre-written prompts when there is no project brief or no selected
+   *  OpenCode model for generation. */
   blank: boolean;
 }
 
@@ -366,6 +367,7 @@ export const prewarmStarterPrompts = (body: {
   paperId?: string;
   path?: string;
   locale: string;
+  starterAgent?: Pick<AgentSelection, "harness" | "model">;
 }) => post<{ ok: boolean }>("/api/projects/starter-prompts/prewarm", body);
 
 /** Slow on a cache miss (one headless model call over a brief of the project). */
@@ -394,6 +396,8 @@ export const listExperiments = (projectId: string, signal?: AbortSignal) =>
     (r) => r.experiments,
   );
 
+export const deleteExperiment = (id: string) =>
+  writeResponse(`/api/experiments/${id}`, { method: "DELETE" }).then((r) => json<{ ok: boolean; branchCommit: string | null }>(r));
 export const setExperimentArchived = (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) =>
   patch<{ ids: string[] }>(`/api/experiments/${id}/archive`, { direction, archived });
 
@@ -1185,29 +1189,41 @@ export interface RayPreflight {
 export const rayPreflight = (address?: string) =>
   post<RayPreflight>("/api/settings/ray/preflight", { address: address ?? null });
 
-export interface TrackioSettings {
-  serverUrl: string | null;
-  project: string | null;
+export interface TrackioRuns {
+  /** Null until something has logged to the local store. */
+  dashboardUrl: string | null;
+  project: string;
+  /** Run ids and names that have logged to the project. */
+  runs: string[];
+  /** A private Space's read-only `__sign`; without it the browser gets a 404. */
+  dashboardSign: string | null;
 }
 
-export const getTrackioSettings = (signal?: AbortSignal) =>
-  get<TrackioSettings>("/api/settings/trackio", signal);
+export const getTrackioRuns = (projectId: string, signal?: AbortSignal) =>
+  get<TrackioRuns>(`/api/trackio/projects/${encodeURIComponent(projectId)}/runs`, signal);
 
 export interface TrackioPreflight {
   reachable: boolean;
   version: string | null;
   writeAccess: boolean | null;
   error: string | null;
+  /** The Space's runtime stage, e.g. SLEEPING; null for a self-hosted server. */
+  spaceStage: string | null;
 }
 
 export const trackioPreflight = () => post<TrackioPreflight>("/api/settings/trackio/preflight", {});
 
-/** The run on the saved Trackio dashboard; hf runs never receive the Trackio variables. */
-export function trackioRunUrl(settings: TrackioSettings | undefined, run: Pick<Run, "id" | "backend">) {
-  if (!settings?.serverUrl || backendKind(run.backend) === "hf_job") return null;
-  if (!settings.project) return settings.serverUrl;
-  const query = new URLSearchParams({ project: settings.project, runs: run.id });
-  return `${settings.serverUrl}/?${query}`;
+/** The run on its Trackio dashboard, only once it has logged there. `embed` hides the dashboard chrome. */
+export function trackioRunUrl(trackio: TrackioRuns | undefined, runId: string, embed?: { theme: string }) {
+  if (!trackio?.dashboardUrl || !trackio.runs.includes(runId)) return null;
+  const query = new URLSearchParams({ project: trackio.project, runs: runId });
+  if (trackio.dashboardSign) query.set("__sign", trackio.dashboardSign);
+  if (embed) {
+    query.set("sidebar", "hidden");
+    query.set("navbar", "hidden");
+    query.set("__theme", embed.theme);
+  }
+  return `${trackio.dashboardUrl}/?${query}`;
 }
 
 // --- settings: compute targets (unified list + default) ------------------------
@@ -1748,6 +1764,7 @@ export interface Harness {
   /** A running turn takes further input, so the composer steers instead of
    * queueing. Narrowed per installation (codex's legacy exec path can't). */
   supportsSteering: boolean;
+  supportsCompaction: boolean;
   /** A snapshot answer whose model catalog is still filling in the
    * background — `models` stays empty until `harness.catalog`
    * arrives and a plain re-read swaps in the real list. */
@@ -1798,6 +1815,7 @@ export const setChatConfiguration = (sessionId: string, optionId: string, value:
 /** Slash-skill offered in the composer's `/` dropdown; expanded server-side. */
 export interface SkillInfo {
   name: string;
+  disabled?: boolean;
   plugin?: string | null;
   harness?: string | null;
   description: string;
@@ -1807,7 +1825,7 @@ export interface SkillInfo {
 
 export const getSkills = (signal?: AbortSignal, harness?: string, projectId?: string) => {
   const query = new URLSearchParams({ ...(harness ? { harness } : {}), ...(projectId ? { project: projectId } : {}) });
-  return get<{ skills: SkillInfo[]; importing: boolean }>(`/api/skills${query.size ? `?${query}` : ""}`, signal);
+  return get<{ skills: SkillInfo[] }>(`/api/skills${query.size ? `?${query}` : ""}`, signal);
 };
 
 export const getSkillContent = (name: string, projectId?: string, signal?: AbortSignal, harness?: string | null) =>
@@ -1853,7 +1871,7 @@ export interface UserSkill {
 }
 
 export const listUserSkills = (signal?: AbortSignal) =>
-  get<{ skills: UserSkill[]; importing: boolean }>("/api/user-skills", signal);
+  get<{ skills: UserSkill[] }>("/api/user-skills", signal);
 
 /** Upload a SKILL.md file or a .zip of a skill folder. `contentBase64` is the
  * raw file bytes; `filename`'s extension selects single-file vs archive. */
